@@ -1,0 +1,135 @@
+""" For sampling one-cell-cycle realisations of the replication program.
+
+"""
+import numpy as np
+from random import random as runif
+
+def MC_phantoms(I,lim):
+    Ny, Nu = I.shape
+    
+    phantoms =[]
+    for y in range(Ny):
+        u=0
+        fired=False
+        while ((u<Nu) and not(fired)):
+            r=runif()
+            p = I[y,u]*lim['du']*lim['dy']
+            if (r < p):
+                phantoms += [(lim['y'][y],lim['u'][u])]
+                fired = True
+            u +=1
+            
+    phantoms = np.array(phantoms, dtype=[('y',float),('u',float)])    
+    return phantoms
+
+def get_origins_from_phantoms(phantoms,lim):
+    N=len(phantoms)
+    origins = np.array(np.zeros(N), dtype=[('y',float),('u',float),('is_ori',bool)])    
+    origins['y'] = phantoms['y']
+    origins['u'] = phantoms['u']
+    origins['is_ori'] = True
+    origins.sort(order='u')
+
+    for i in range(N):
+        if origins['is_ori'][i]:
+             yi=origins['y'][i]
+             ui=origins['u'][i]      
+             not_passive = (lim['v']*(origins['u'] - ui) < abs(origins['y'] - yi))
+             origins['is_ori'] = (origins['is_ori'] & not_passive)
+             origins['is_ori'][i] = True #i ne verifie pas not_passive mais est ok
+
+    oris = origins[origins['is_ori']]
+    oris.sort(order='y')
+    return oris
+
+def get_oriter_from_oris(oris,lim):
+    oris.sort(order='y')
+    N=len(oris) 
+    oriter = np.array(np.zeros(2*N+1), dtype=[('y',float),('u',float),('type',int)])
+    
+    #bord gauche
+    oriter['y'][0] = lim['y'].min()
+    oriter['u'][0] = oris['u'][0] + abs(oris['y'][0]-lim['y'].min())/float(lim['v'])
+    oriter['type'][0] = 2
+
+    #bord droit
+    oriter['y'][2*N] = lim['y'].max()
+    oriter['u'][2*N] = oris['u'][N-1] + abs(oris['y'][N-1]-lim['y'].max())/float(lim['v'])
+    oriter['type'][2*N] = 2
+
+    #oris
+    for i in range(N):
+        oriter['y'][2*i+1] = oris['y'][i]
+        oriter['u'][2*i+1] = oris['u'][i]
+        oriter['type'][2*i+1] = 0
+    
+   #ter
+    for i in range(1,N):
+        yi = 0.5*(oris['y'][i] + oris['y'][i-1])\
+                + 0.5*lim['v']*(oris['u'][i] - oris['u'][i-1])
+        ui = 0.5*(oris['u'][i] + oris['u'][i-1])\
+                + 0.5*(oris['y'][i] - oris['y'][i-1])/float(lim['v'])
+        oriter['y'][2*i] = yi
+        oriter['u'][2*i] = ui
+        oriter['type'][2*i] = 1
+  
+    return oriter
+
+def get_timing_from_oris(oris,lim):
+    oris.sort(order='y')
+    tim = np.array(np.zeros(lim['Ny']), dtype=[('y',float),('u',float)])
+    tim['y']=lim['y']
+    
+    N=len(oris)
+    for i in range(N):
+        if i==0:
+            ya = lim['y'].min()
+        else:
+            ya = 0.5*(oris['y'][i] + oris['y'][i-1])\
+                + 0.5*lim['v']*(oris['u'][i] - oris['u'][i-1])
+        if i==(N-1):
+            yb = lim['y'].max()
+        else:
+            yb = 0.5*(oris['y'][i+1] + oris['y'][i])\
+                + 0.5*lim['v']*(oris['u'][i+1] - oris['u'][i])
+        #sur l'interval [ya,yb]
+        ind = np.where((ya <= tim['y']) & (tim['y'] <= yb)) 
+        tim['u'][ind] = oris['u'][i] + abs(tim['y'][ind]-oris['y'][i])/float(lim['v'])
+    
+    return tim
+
+def MC_estimation_N_ori(I,lim,N_MC=20):  
+    N_ori = []
+    for i in range(N_MC):
+        phantoms = MC_phantoms(I,lim)
+        oris = get_origins_from_phantoms(phantoms,lim)
+        N_ori += [len(oris)]
+    N_ori = np.array(N_ori)
+    print "MC estimation mean N_ori={:.3f}".format(N_ori.mean())
+    return N_ori
+
+def get_one_cell_cycle_realisation(I,lim):
+    """Sample a one-cell-cycle realisation of the replication program
+    
+    Parameters
+    ----------
+    I : array
+        The initation rate, array of shape (Ny,Nu)
+    lim : dict
+        lim['v'] : float, fork velocity
+        lim['y'] : array, y-positions of I
+        lim['u'] : array, u-times of I
+        lim['dy'] : float, spatial resolution
+        lim['du'] : float, temporal resolution
+    
+    Returns
+    -------   
+    oriter : array, dtype=[('y',float), ('u',float), ('type',int)]
+        oriter['y'] = position of the ori/ter/border
+        oriter['y'] = time of the ori/ter/border
+        oriter['type'] = 0 (ori), 1 (ter), 2 (border)
+    """
+    phantoms = MC_phantoms(I,lim)
+    oris = get_origins_from_phantoms(phantoms,lim)
+    oriter = get_oriter_from_oris(oris,lim)
+    return oriter

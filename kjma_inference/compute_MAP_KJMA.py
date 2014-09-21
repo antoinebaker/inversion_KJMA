@@ -1,0 +1,278 @@
+"""For computing the MAP estimate of the initiation rate"""
+
+ 
+import numpy as np
+from scipy.optimize import minimize
+from scipy.linalg import toeplitz, cholesky, eigh, inv
+from numpy.linalg import slogdet
+zapsmall = 1e-15
+
+
+def compute_C(z,ell_z):
+    """Utility function"""
+    zapsmall = 1e-15
+    if ell_z==0: return np.identity(len(z))
+    Delta_z = (z[:,np.newaxis]-z)/ell_z
+    Sigma_z = np.exp(-0.5*Delta_z**2)
+    D_z, R_z = eigh(Sigma_z)
+    index_z, = np.where(D_z > zapsmall)
+    range_z = len(index_z)
+    sigma_z = np.sqrt(D_z[index_z])
+    C0_z = np.dot(R_z[:,index_z],np.diag(sigma_z))
+    return C0_z
+
+def product_C0_vec(param, vec):
+    """Utility function"""
+    # vector N_theta
+    vec = vec.reshape(param['range_y'], param['range_u'])
+    C0_vec = param['sigma_0']*np.dot(param['C0_y'], 
+                                    np.dot(vec, param['C0_u'].T))
+    # vector Ny*Nu    
+    C0_vec = C0_vec.ravel()
+    return C0_vec
+
+def product_vec_C0(param, vec):
+    """Utility function"""
+    # vector Ny*Nu    
+    vec = vec.reshape(param['Ny'],param['Nu'])
+    vec_C0 =  param['sigma_0']*np.dot(param['C0_y'].T, 
+                                     np.dot(vec, param['C0_u']))
+    # vector N_theta
+    vec_C0 = vec_C0.ravel()
+    return vec_C0
+
+def product_mat_C0(param, mat):
+    """Utility function"""
+    # matrix (Ni, Ny*Nu)
+    Ni = mat.shape[0]
+    mat = mat.reshape(Ni,param['Ny'],param['Nu'])
+    mat_C0 =  param['sigma_0']*np.tensordot(np.tensordot(mat, 
+                                                        param['C0_y'],
+                                                        axes=(1,0)),
+                                           param['C0_u'],
+                                           axes=(1,0))
+    # matrix (Ni,N_theta)
+    mat_C0 = mat_C0.reshape(Ni,param['N_theta'])
+    return mat_C0
+
+def compute_C0_y_C0_u_for_param(param):
+    """Computes the "square root" of the covariance 
+    used in the Gaussian process prior on m, the log initation rate.
+    
+    Parameters
+    ----------
+    param : dict
+       param['y'] : y-positions
+       param['u'] : u-times
+       param['ell_0'] : prior spatial smoothness scale of m 
+       param['tau_0'] : prior temporal smoothness scale of m
+       param['m_0'] : prior mean of m
+       param['sigma_0'] : prior stddev of m
+    
+    Returns
+    -------
+    Nothing, just adds to the param dict
+        param['C0_y'] : array of shape (Ny,range_y) 
+        param['C0_u'] : array of shape (Nu, range_u)
+        param['N_theta'] : int
+        param['range_y'] : int
+        param['range_u'] : int
+    
+    Notes
+    -----
+    In the inference model, the prior on the log initation rate is `m ~ N(m_0, Sigma_0)`.
+    The prior covariance is equal to `Sigma_0 = sigma_0 * Sigma_y[ell_0] * Sigma_u[tau_0]`, 
+    where `Sigma_y` is the squared-exponential kernel on the positions `y`, with
+    the spatial smoothness scale set to `ell_0` (and similarly for `Sigma_u`).
+    
+    Then the log initation rate can be obtained as `m = m_0 + sigma_0 * C0_y * C0_u * theta`, 
+    where `theta ~ N(0, Id)`, `C0_y` is a square root of `Sigma_y`, 
+    and `C0_u` a sqaure root of `Sigma_u`. 
+    
+    The optimization procedure, as well as the MCMC sampling is much easier
+    to do in the theta coordinates.
+    
+    To compute `C0_y` we use the eigendecompostion of `Sigma_y[ell_0] = R D R.T`,
+    that is `C0_y = R sqrt(D)`. Actually, we truncate D by keeping only the eigenvalues 
+    greater than the numerical precision 1e-15, which results in a sparser model.
+    
+    `C0_y` is then a array of shape (Ny, range_y).
+    `C0_u` is similarly an array of shape (Nu, range_u).
+     
+    Hence theta is an array of shape (range_y, range_u), or (as in the optimization routine)
+    raveled as a vector of length N_theta = range_y*range_u.
+    
+    """
+    C0_y = compute_C(z=param['y'],ell_z=param['ell_0'])
+    C0_u = compute_C(z=param['u'],ell_z=param['tau_0'])
+    (Ny, range_y) = C0_y.shape
+    (Nu, range_u) = C0_u.shape
+    param['C0_y'] = C0_y
+    param['C0_u'] = C0_u
+    param['range_y'] = range_y
+    param['range_u'] = range_u
+    param['N_theta'] = range_y*range_u
+
+def objective_MAP_KJMA(theta,param):
+    """Objective function E(theta) for the MAP optimization.
+    
+    E(theta) = 0.5*(d-s)/(sigma_d**2) +0.5*theta**2
+    
+    """
+    
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    d = param['d']
+    E = 0.5*np.sum(theta**2) + 0.5*np.sum((d-s)**2)/(param['sigma_d']**2) 
+    return E
+
+# E'(theta)
+def gradient_MAP_KJMA(theta,param):
+    """Gradient of the objective function E(theta) for the 
+    MAP optimization"""
+    
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    d = param['d']
+    u = np.dot(s*(d-s),param['R'])*I
+    u_C0 = product_vec_C0(param, u)
+    grad_E = theta + np.log(10)*u_C0/(param['sigma_d']**2)
+    return grad_E
+
+# E''(theta) p for any vector p
+def hessp_MAP_KJMA(theta,p,param):
+    """Product H(theta) times p, for any vector p, where H(theta) is the 
+    Hessian of the objective function E(theta) for the MAP optimization
+    
+    """
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    d = param['d']
+    u = np.dot(s*(d-s),param['R'])*I
+    C0_p = product_C0_vec(param, p)
+    w = np.dot(param['R'],I*C0_p)
+    y = np.dot(s*(2*s-d)*w,param['R'])*I + u*C0_p
+    y_C0 = product_vec_C0(param, y)
+    Hp = p + (np.log(10)**2)*y_C0/(param['sigma_d']**2)
+    return Hp
+
+
+#pseudo E''(theta) p for any vector p 
+def pseudo_hessp_MAP_KJMA(theta,p,param):
+    """Product H(theta) p, for any vector p, where H(theta) is 
+    the pseudo-hessian of the objective function E(theta)
+    for the MAP optimization. 
+    
+    Note
+    ----
+    The pseudo-Hessian is guaranteed to be positive-definite.
+    
+    """
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    C0_p = product_C0_vec(param, p)
+    w = np.dot(param['R'],I*C0_p)
+    y = np.dot(s*s*w,param['R'])*I
+    y_C0 = product_vec_C0(param, y)
+    Hp = p + (np.log(10)**2)*y_C0/(param['sigma_d']**2)
+    return Hp
+
+#E''(theta)
+def hessian_MAP_KJMA(theta,param):
+    """Hessian of the objective function E(theta) or the 
+    MAP optimization"""
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    r = param['d']-s
+    
+    J_m = -np.log(10)*s[:,np.newaxis]*I[np.newaxis,:]*param['R']
+    K_m = -np.log(10)*r[:,np.newaxis]*I[np.newaxis,:]*param['R']
+    J_theta = product_mat_C0(param, J_m)
+    K_theta = product_mat_C0(param, K_m)
+    
+    rJ = np.dot(r,J_m)
+    rJ = rJ.reshape(param['Ny'],param['Nu'])
+    C0T_rJ = param['sigma_0'] * (rJ[np.newaxis,np.newaxis,:,:]
+                                *(param['C0_y'].T)[:,np.newaxis,:,np.newaxis]
+                                *(param['C0_u'].T)[np.newaxis,:,np.newaxis,:])
+    C0T_rJ = C0T_rJ.reshape(param['N_theta'], param['Ny']*param['Nu'])
+    C0T_rJ_C0 = product_mat_C0(param, C0T_rJ)
+    
+    H1_theta = np.dot(J_theta.T,J_theta)
+    H2_theta = np.dot(K_theta.T,J_theta) + np.log(10)*C0T_rJ_C0
+    H = np.identity(param['N_theta']) + (H1_theta - H2_theta)/(param['sigma_d']**2)
+    return H
+
+#pseudo E''(theta)
+def pseudo_hessian_MAP_KJMA(theta,param):
+    """Pseudo-hessian of the objective function E(theta) 
+    for the MAP optimization. T
+    
+    Note
+    ----
+    The pseudo-Hessian is guaranteed to be positive-definite.
+    
+    """
+    C0_theta = product_C0_vec(param, theta)
+    m = param['m_0'] + C0_theta
+    I = 10**m
+    A = np.dot(param['R'],I)
+    s = np.exp(-A)
+    r = param['d']-s
+    J_m = -np.log(10)*s[:,np.newaxis]*I[np.newaxis,:]*param['R']
+    J_theta = product_mat_C0(param, J_m)
+    H1_theta = np.dot(J_theta.T,J_theta)
+    H = np.identity(param['N_theta']) + H1_theta/(param['sigma_d']**2)
+    return H
+
+def compute_theta_MAP_estimate(param):
+    """Perfom the minimization of the objective function E(theta)"""
+    # optimization 
+    options={'xtol': 1e-8, 'disp': False, 'maxiter':200}
+    theta0 = np.zeros(param['N_theta'],float)
+    res = minimize(objective_MAP_KJMA, theta0, 
+                   args=(param,), method='Newton-CG', 
+                   jac=gradient_MAP_KJMA, hessp=pseudo_hessp_MAP_KJMA, 
+                   options=options)
+    theta_MAP = res.x
+    print res.message
+    return theta_MAP
+
+def compute_I_MAP_estimate(param, theta_MAP):
+    """Compute the MAP estimate of I.""" 
+    # theta_MAP vector N_theta
+    C0_theta_MAP = product_C0_vec(param, theta_MAP)
+    # m_MAP vector Nyu   
+    m_MAP = param['m_0'] + C0_theta_MAP
+    # I_MAP matrix Ny*Nu
+    I_MAP = 10**m_MAP.reshape(param['Ny'],param['Nu'])
+    return I_MAP
+
+# Laplace approximation theta ~ N(theta_MAP,Sigma_MAP)
+# evidence Z(d) = P(d)
+# log Z = - E_MAP - (N_d/2)*log(2*pi*sigma_d**2) - 0.5*log(det(H_MAP)) 
+def compute_logZ(param, theta_MAP, H_MAP):
+    """Compute the log evidence, using the laplace approximation"""
+    
+    E_MAP = objective_MAP_KJMA(theta_MAP,param)
+    N_d = len(param['d'])
+    sigma_d = param['sigma_d']
+    (sign, logdet) = np.linalg.slogdet(H_MAP)
+    assert sign==1
+    log_Z = - E_MAP - 0.5*N_d*np.log(2*np.pi*sigma_d**2) - 0.5*logdet
+    return log_Z
